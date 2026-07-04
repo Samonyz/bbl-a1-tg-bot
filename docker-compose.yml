@@ -1,0 +1,6 @@
+services:
+  bambu-bot:
+    build: .
+    image: bambu-telegram-bot:latest
+    restart: unless-stopped
+    env_file: .env
