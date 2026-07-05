@@ -1,0 +1,25 @@
+# Список принтеров. Имя (name) используется в тегах сообщений [name] и в
+# суффиксах команд /status_<name>, /photo_<name>, /light_on_<name> и т.д.
+# Допустимые символы для name: a-z, 0-9, _ (латиница в нижнем регистре, до 20 символов).
+# Имена должны быть уникальны среди bambu_printers и moonraker_printers вместе.
+
+bambu_printers:
+  - name: a1
+    # Настройки -> WLAN на экране принтера, или приложение Bambu Handy
+    ip: "192.168.1.50"
+    access_code: "12345678"
+    serial: "01P00A000000000"
+    # Опционально, иначе берётся DEFAULT_POLL_INTERVAL_SECONDS / DEFAULT_PROGRESS_UPDATE_SECONDS из .env
+    poll_interval_seconds: 5
+    progress_update_seconds: 60
+
+moonraker_printers:
+  - name: k1c
+    moonraker_url: "http://192.168.1.92:7125"
+    camera_snapshot_url: "http://192.168.1.92:8080/?action=snapshot"
+    # Опционально: если Moonraker закрыт авторизацией, укажи API-ключ
+    # (Settings -> Moonraker -> API Key в Mainsail/Fluidd) - будет отправлен
+    # заголовком X-Api-Key. Если авторизация не требуется - просто не указывай.
+    # api_key: "your-moonraker-api-key"
+    poll_interval_seconds: 5
+    progress_update_seconds: 60

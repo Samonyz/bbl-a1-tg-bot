@@ -1,3 +1,4 @@
 .env
+printers.yaml
 __pycache__/
 *.pyc

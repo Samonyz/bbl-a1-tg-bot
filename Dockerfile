@@ -9,6 +9,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py locales.py .
+COPY bot.py locales.py printers_config.py ./
 
 CMD ["python", "bot.py"]
