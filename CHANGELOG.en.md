@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0-beta] - 2026-07-12
+
+### Added
+
+- Active spool display in print status: color (emoji) and slot position (`T1`-`T4`, `A`-`D`) for Creality CFS and Bambu AMS in a unified `[-emoji--] T1B PLA` format. Without AMS/CFS, or when printing from the external holder, a separate line shows the external filament's material/color if known.
+
+### Changed
+
+- Moonraker progress percentage is now computed from `virtual_sdcard.progress` (file byte position) instead of `display_status.progress` (slicer time estimate, drifts on prints with filament-change pauses).
+
+### Note
+
+- The Bambu AMS logic is based on the publicly documented MQTT schema (`tray_now`), not verified against real hardware yet - needs confirmation once an AMS unit is connected.
+
 ## [2.0.1] - 2026-07-11
 
 ### Fixed
