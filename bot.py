@@ -92,12 +92,25 @@ def _placeholder_photo() -> bytes:
 class TelegramNotifierMixin:
     """Общая отправка/редактирование сообщений для мониторов принтеров.
 
-    Подклассы обязаны иметь атрибуты tag, chat_id, progress_message_id
-    и методы snapshot() / get_photo().
+    Подклассы обязаны иметь атрибуты tag, chat_id, progress_message_id,
+    _last_photo и методы snapshot() / get_photo().
     """
 
     def _tagged(self, text: str) -> str:
         return f"[{self.tag}] {text}"
+
+    async def _cached_photo(self, fresh: bytes | None) -> bytes:
+        """Кэширует последний реально полученный кадр с камеры на время
+        текущей печати. Если новый кадр получить не удалось - отдаём
+        последний известный, а не сразу заглушку (заглушка только пока
+        вообще ни одного кадра ещё не было, например в начале печати).
+        """
+        if fresh is not None:
+            self._last_photo = fresh
+            return fresh
+        if self._last_photo is not None:
+            return self._last_photo
+        return _placeholder_photo()
 
     async def send_event(self, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         details = await self.get_snapshot()
@@ -163,6 +176,7 @@ class PrinterMonitor(TelegramNotifierMixin):
         self.prev_error_code: int = 0
         self.last_progress_update: float | None = None
         self.progress_message_id: int | None = None
+        self._last_photo: bytes | None = None
 
     def snapshot(self) -> str:
         state = self.printer.get_state()
@@ -193,15 +207,15 @@ class PrinterMonitor(TelegramNotifierMixin):
 
     async def get_photo(self) -> bytes:
         if not self.printer.camera_client_alive():
-            return _placeholder_photo()
+            return await self._cached_photo(None)
         try:
             image = await asyncio.to_thread(self.printer.get_camera_image)
         except Exception:
             log.exception("Failed to grab camera frame [%s]", self.tag)
-            return _placeholder_photo()
+            return await self._cached_photo(None)
         buf = io.BytesIO()
         image.save(buf, format="JPEG")
-        return buf.getvalue()
+        return await self._cached_photo(buf.getvalue())
 
     async def poll(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
@@ -230,9 +244,10 @@ class PrinterMonitor(TelegramNotifierMixin):
 
             if state not in RUNNING_STATES and state not in PAUSED_STATES:
                 # печать закончилась (или сброшена в IDLE) - следующая начнётся
-                # с нового сообщения прогресса
+                # с нового сообщения прогресса и своего кадра камеры
                 self.progress_message_id = None
                 self.last_progress_update = None
+                self._last_photo = None
 
         if error_code and error_code != self.prev_error_code:
             events.append(t("event.error", code=error_code, url=HMS_WIKI_URL))
@@ -276,6 +291,7 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
         self.prev_state: bl.GcodeState | None = None
         self.last_progress_update: float | None = None
         self.progress_message_id: int | None = None
+        self._last_photo: bytes | None = None
         self._last_status: dict | None = None
 
     async def _fetch_status(self) -> dict:
@@ -313,10 +329,10 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
         try:
             resp = await self.client.get(self.camera_snapshot_url)
             resp.raise_for_status()
-            return resp.content
+            return await self._cached_photo(resp.content)
         except Exception:
             log.exception("Failed to grab camera frame [%s]", self.tag)
-            return _placeholder_photo()
+            return await self._cached_photo(None)
 
     async def poll(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
@@ -348,6 +364,7 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
             if state not in RUNNING_STATES and state not in PAUSED_STATES:
                 self.progress_message_id = None
                 self.last_progress_update = None
+                self._last_photo = None
 
         progress_due = False
         if state in RUNNING_STATES:
