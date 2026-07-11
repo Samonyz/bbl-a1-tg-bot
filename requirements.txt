@@ -2,3 +2,4 @@ bambulabs_api==2.6.6
 python-telegram-bot[job-queue]==22.8
 httpx==0.28.1
 PyYAML==6.0.2
+Pillow==12.3.0

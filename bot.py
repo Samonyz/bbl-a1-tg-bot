@@ -7,8 +7,9 @@ from datetime import datetime
 
 import bambulabs_api as bl
 import httpx
+from PIL import Image
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
-from telegram.error import TelegramError
+from telegram.error import NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -69,6 +70,25 @@ def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+_placeholder_photo_cache: bytes | None = None
+
+
+def _placeholder_photo() -> bytes:
+    """Нейтральная заглушка, когда реальный кадр с камеры недоступен.
+
+    Используется, чтобы сообщение прогресса ВСЕГДА было фото-сообщением -
+    иначе редактирование текстового сообщения (без caption) как caption
+    гарантированно валится с "There is no caption in the message to edit".
+    """
+    global _placeholder_photo_cache
+    if _placeholder_photo_cache is None:
+        img = Image.new("RGB", (640, 480), color=(45, 45, 51))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        _placeholder_photo_cache = buf.getvalue()
+    return _placeholder_photo_cache
+
+
 class TelegramNotifierMixin:
     """Общая отправка/редактирование сообщений для мониторов принтеров.
 
@@ -84,12 +104,7 @@ class TelegramNotifierMixin:
         photo = await self.get_photo()
         timestamp = t("footer.time", time=_now_str())
         message = self._tagged(f"{text}\n\n{details}\n\n{timestamp}")
-        if photo:
-            await context.bot.send_photo(
-                chat_id=self.chat_id, photo=photo, caption=message
-            )
-        else:
-            await context.bot.send_message(chat_id=self.chat_id, text=message)
+        await context.bot.send_photo(chat_id=self.chat_id, photo=photo, caption=message)
 
     async def update_progress_message(
         self, context: ContextTypes.DEFAULT_TYPE
@@ -100,18 +115,23 @@ class TelegramNotifierMixin:
 
         if self.progress_message_id is not None:
             try:
-                if photo:
-                    await context.bot.edit_message_media(
-                        chat_id=self.chat_id,
-                        message_id=self.progress_message_id,
-                        media=InputMediaPhoto(photo, caption=caption),
-                    )
-                else:
-                    await context.bot.edit_message_caption(
-                        chat_id=self.chat_id,
-                        message_id=self.progress_message_id,
-                        caption=caption,
-                    )
+                await context.bot.edit_message_media(
+                    chat_id=self.chat_id,
+                    message_id=self.progress_message_id,
+                    media=InputMediaPhoto(photo, caption=caption),
+                )
+                return
+            except (NetworkError, RetryAfter) as e:
+                # Таймаут/сетевой сбой/флуд-контроль не значит, что сообщение
+                # потеряно - редактирование могло и пройти на сервере. Пробуем
+                # отредактировать то же самое сообщение на следующем цикле,
+                # а не считаем его "битым" и не шлём новое.
+                log.warning(
+                    "Временная ошибка при редактировании сообщения прогресса [%s], "
+                    "повторим на следующем цикле: %s",
+                    self.tag,
+                    e,
+                )
                 return
             except TelegramError as e:
                 log.warning(
@@ -121,12 +141,9 @@ class TelegramNotifierMixin:
                 )
                 self.progress_message_id = None
 
-        if photo:
-            msg = await context.bot.send_photo(
-                chat_id=self.chat_id, photo=photo, caption=caption
-            )
-        else:
-            msg = await context.bot.send_message(chat_id=self.chat_id, text=caption)
+        msg = await context.bot.send_photo(
+            chat_id=self.chat_id, photo=photo, caption=caption
+        )
         self.progress_message_id = msg.message_id
 
 
@@ -174,14 +191,14 @@ class PrinterMonitor(TelegramNotifierMixin):
         # команд Telegram).
         return await asyncio.to_thread(self.snapshot)
 
-    async def get_photo(self) -> bytes | None:
+    async def get_photo(self) -> bytes:
         if not self.printer.camera_client_alive():
-            return None
+            return _placeholder_photo()
         try:
             image = await asyncio.to_thread(self.printer.get_camera_image)
         except Exception:
             log.exception("Failed to grab camera frame [%s]", self.tag)
-            return None
+            return _placeholder_photo()
         buf = io.BytesIO()
         image.save(buf, format="JPEG")
         return buf.getvalue()
@@ -292,14 +309,14 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
         # без сети - можно звать напрямую без отдельного потока.
         return self.snapshot()
 
-    async def get_photo(self) -> bytes | None:
+    async def get_photo(self) -> bytes:
         try:
             resp = await self.client.get(self.camera_snapshot_url)
             resp.raise_for_status()
             return resp.content
         except Exception:
             log.exception("Failed to grab camera frame [%s]", self.tag)
-            return None
+            return _placeholder_photo()
 
     async def poll(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
@@ -359,18 +376,15 @@ def authorized(update: Update) -> bool:
 async def _reply_status(update: Update, monitor) -> None:
     text = f"{await monitor.get_snapshot()}\n\n{t('footer.time', time=_now_str())}"
     photo = await monitor.get_photo()
-    if photo:
-        await update.message.reply_photo(photo=photo, caption=text)
-    else:
-        await update.message.reply_text(text)
+    await update.message.reply_photo(photo=photo, caption=text)
 
 
 async def _reply_photo(update: Update, monitor) -> None:
     photo = await monitor.get_photo()
-    if photo:
-        await update.message.reply_photo(photo=photo)
-    else:
+    if photo == _placeholder_photo():
         await update.message.reply_text(t("cmd.camera_unavailable"))
+    else:
+        await update.message.reply_photo(photo=photo)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
