@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] - 2026-07-11
+
+### Fixed
+
+- Duplicate progress messages caused by resetting `progress_message_id` on network errors and by editing captions on text-only messages. Progress messages are now always photos: the last camera frame for the current print, or a placeholder.
+
 ## [2.0.0] - 2026-07-05
 
 ### Added
