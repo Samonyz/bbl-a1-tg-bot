@@ -70,6 +70,102 @@ def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# Палитра для приближённого отображения цвета катушки эмодзи-кругом.
+_COLOR_EMOJI = [
+    ((255, 255, 255), "⚪"),
+    ((0, 0, 0), "⚫"),
+    ((128, 128, 128), "🔘"),
+    ((237, 28, 36), "🔴"),
+    ((255, 140, 0), "🟠"),
+    ((255, 221, 0), "🟡"),
+    ((0, 153, 68), "🟢"),
+    ((0, 120, 215), "🔵"),
+    ((150, 60, 180), "🟣"),
+    ((140, 90, 60), "🟤"),
+]
+
+
+def _color_emoji(hex_color: str) -> str:
+    hex_color = hex_color[-6:]
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    return min(
+        _COLOR_EMOJI,
+        key=lambda entry: sum((a - c) ** 2 for a, c in zip((r, g, b), entry[0])),
+    )[1]
+
+
+def _active_spool(box: dict) -> tuple[str, str, str] | None:
+    """Возвращает (тег слота вида 'T1B', материал, цвет-эмодзи) активной
+    катушки CFS, либо None, если CFS не подключена или слот не выбран."""
+    same_material = box.get("same_material") or []
+    for box_key in ("T1", "T2", "T3", "T4"):
+        slot = box.get(box_key)
+        if not isinstance(slot, dict) or slot.get("state") != "connect":
+            continue
+        letter = slot.get("filament")
+        if not letter or letter == "None":
+            continue
+        tag = f"{box_key}{letter}"
+        for _material_code, color_hex, tags, material_name in same_material:
+            if tag in tags:
+                return tag, material_name, _color_emoji(color_hex)
+    return None
+
+
+def _active_ams_spool(ams_info: dict) -> tuple[str, str, str] | None:
+    """Возвращает (тег слота вида 'T1B', материал, цвет-эмодзи) активной
+    катушки AMS, либо None, если печать идёт с внешней катушки, AMS не
+    подключена или для выбранного слота нет данных.
+
+    Основано на публично известной схеме поля "ams" в MQTT-статусе Bambu
+    (bambulabs_api парсит сами трэи, но не поле tray_now) - надо будет
+    перепроверить на реальном железе, когда приедет AMS.
+    """
+    try:
+        idx = int(ams_info.get("tray_now"))
+    except (TypeError, ValueError):
+        return None
+    if idx >= 254:  # 254 = внешняя катушка, 255 = не выбрана
+        return None
+    unit, slot = divmod(idx, 4)
+    letter = "ABCD"[slot]
+    for ams_unit in ams_info.get("ams", []):
+        if int(ams_unit.get("id", -1)) != unit:
+            continue
+        for tray in ams_unit.get("tray", []):
+            if int(tray.get("id", -1)) != slot:
+                continue
+            color_hex = (tray.get("tray_color") or "")[:6]
+            if not color_hex:
+                return None
+            material = tray.get("tray_type") or "?"
+            return f"T{unit + 1}{letter}", material, _color_emoji(color_hex)
+    return None
+
+
+def _vt_tray_spool(vt_tray: dict) -> tuple[str, str] | None:
+    """Возвращает (материал, цвет-эмодзи) внешней катушки Bambu (vt_tray -
+    единственный держатель принтера без AMS), либо None, если данных нет."""
+    if not vt_tray:
+        return None
+    color_hex = (vt_tray.get("tray_color") or "")[:6]
+    material = vt_tray.get("tray_type") or ""
+    if not color_hex or not material:
+        return None
+    return material, _color_emoji(color_hex)
+
+
+def _spool_line(spool: tuple[str, str, str] | None) -> str:
+    """Строка с катушкой для сообщения о печати: позиция слота A-D показана
+    смещением цветного эмодзи внутри '[----]', плюс тег слота и материал."""
+    if spool is None:
+        return t("snapshot.spool_external")
+    tag, material, emoji = spool
+    idx = "ABCD".index(tag[-1])
+    bar = "[" + "-" * idx + emoji + "-" * (3 - idx) + "]"
+    return t("snapshot.spool", bar=bar, tag=tag, material=material)
+
+
 _placeholder_photo_cache: bytes | None = None
 
 
@@ -196,6 +292,19 @@ class PrinterMonitor(TelegramNotifierMixin):
                 lines.append(t("snapshot.layer", current=layer_cur, total=layer_total))
             if remaining not in (None, "N/A"):
                 lines.append(t("snapshot.remaining", remaining=remaining))
+            print_data = self.printer.mqtt_dump().get("print", {})
+            ams_info = print_data.get("ams") or {}
+            if ams_info and ams_info.get("ams_exist_bits", "0") != "0":
+                lines.append(_spool_line(_active_ams_spool(ams_info)))
+            else:
+                ext = _vt_tray_spool(print_data.get("vt_tray") or {})
+                if ext is not None:
+                    material, emoji = ext
+                    lines.append(
+                        t("snapshot.spool_external_material", emoji=emoji, material=material)
+                    )
+                else:
+                    lines.append(t("snapshot.spool_external"))
         return "\n".join(lines)
 
     async def get_snapshot(self) -> str:
@@ -297,7 +406,7 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
     async def _fetch_status(self) -> dict:
         resp = await self.client.get(
             "/printer/objects/query",
-            params={"print_stats": "", "display_status": ""},
+            params={"print_stats": "", "virtual_sdcard": "", "box": ""},
         )
         resp.raise_for_status()
         return resp.json()["result"]["status"]
@@ -307,9 +416,12 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
             return t(f"state.{bl.GcodeState.UNKNOWN.name}")
 
         print_stats = self._last_status["print_stats"]
-        display_status = self._last_status["display_status"]
+        # virtual_sdcard.progress - доля прочитанных байт файла, точнее
+        # display_status.progress (тот часто основан на оценке слайсера по
+        # времени, которая на CFS-печатях с паузами на смену прутка уплывает).
+        virtual_sdcard = self._last_status["virtual_sdcard"]
         state = MOONRAKER_STATE_MAP.get(print_stats["state"], bl.GcodeState.UNKNOWN)
-        percent = _percent(round((display_status.get("progress") or 0) * 100))
+        percent = _percent(round((virtual_sdcard.get("progress") or 0) * 100))
         name = print_stats.get("filename") or "?"
 
         status_label = t(f"state.{state.name}")
@@ -318,6 +430,9 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
             lines.append(t("snapshot.file", name=name))
             if percent is not None:
                 lines.append(t("snapshot.progress", percent=percent))
+            box = self._last_status.get("box")
+            if box:
+                lines.append(_spool_line(_active_spool(box)))
         return "\n".join(lines)
 
     async def get_snapshot(self) -> str:
