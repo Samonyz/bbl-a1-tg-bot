@@ -404,14 +404,23 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
         self.progress_message_id: int | None = None
         self._last_photo: bytes | None = None
         self._last_status: dict | None = None
+        self._metadata: dict | None = None
+        self._metadata_filename: str | None = None
 
     async def _fetch_status(self) -> dict:
         resp = await self.client.get(
             "/printer/objects/query",
-            params={"print_stats": "", "virtual_sdcard": "", "box": ""},
+            params={"print_stats": "", "virtual_sdcard": "", "box": "", "gcode_move": ""},
         )
         resp.raise_for_status()
         return resp.json()["result"]["status"]
+
+    async def _fetch_metadata(self, filename: str) -> dict:
+        resp = await self.client.get(
+            "/server/files/metadata", params={"filename": filename}
+        )
+        resp.raise_for_status()
+        return resp.json()["result"]
 
     def snapshot(self) -> str:
         if self._last_status is None:
@@ -422,6 +431,7 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
         # display_status.progress (тот часто основан на оценке слайсера по
         # времени, которая на CFS-печатях с паузами на смену прутка уплывает).
         virtual_sdcard = self._last_status["virtual_sdcard"]
+        gcode_move = self._last_status.get("gcode_move") or {}
         state = MOONRAKER_STATE_MAP.get(print_stats["state"], bl.GcodeState.UNKNOWN)
         percent = _percent(round((virtual_sdcard.get("progress") or 0) * 100))
         name = print_stats.get("filename") or "?"
@@ -432,6 +442,24 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
             lines.append(t("snapshot.file", name=name))
             if percent is not None:
                 lines.append(t("snapshot.progress", percent=percent))
+
+            metadata = self._metadata or {}
+            layer_cur = virtual_sdcard.get("layer")
+            layer_total = metadata.get("layer_count") or virtual_sdcard.get("layer_count")
+            if layer_cur and layer_total:
+                lines.append(t("snapshot.layer", current=layer_cur, total=layer_total))
+
+            position = gcode_move.get("position")
+            object_height = metadata.get("object_height")
+            if position and object_height:
+                lines.append(
+                    t(
+                        "snapshot.height",
+                        current=round(position[2], 1),
+                        total=round(object_height, 1),
+                    )
+                )
+
             box = self._last_status.get("box")
             if box:
                 lines.append(_spool_line(_active_spool(box)))
@@ -461,6 +489,19 @@ class MoonrakerPrinterMonitor(TelegramNotifierMixin):
         self._last_status = status
         print_stats = status["print_stats"]
         state = MOONRAKER_STATE_MAP.get(print_stats["state"], bl.GcodeState.UNKNOWN)
+
+        filename = print_stats.get("filename")
+        if filename and filename != self._metadata_filename:
+            # Метаданные (высота модели, число слоёв из слайсера) не
+            # меняются для данного файла - запрашиваем один раз за печать,
+            # а не на каждом опросе. self._metadata_filename обновляем
+            # только при успехе, чтобы при сбое повторить на следующем цикле.
+            self._metadata = None
+            try:
+                self._metadata = await self._fetch_metadata(filename)
+                self._metadata_filename = filename
+            except Exception:
+                log.exception("Failed to fetch gcode metadata [%s]", self.tag)
 
         events = []
         just_started = False
