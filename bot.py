@@ -96,14 +96,19 @@ def _color_emoji(hex_color: str) -> str:
     )[1]
 
 
-def _active_spool(box: dict) -> tuple[str, str, str] | None:
+def _active_spool(box: dict) -> tuple[str, str, str] | str | None:
     """Возвращает (тег слота вида 'T1B', материал, цвет-эмодзи) активной
-    катушки CFS, либо None, если CFS не подключена или слот не выбран."""
+    катушки CFS; 'changing', если бокс подключён, но сейчас идёт смена
+    прутка (слот временно не выбран - подтверждено живым наблюдением:
+    T1.filament становится 'None', пока T1.state остаётся 'connect');
+    либо None, если CFS не подключена вообще (печать с внешнего держателя)."""
     same_material = box.get("same_material") or []
+    any_connected = False
     for box_key in ("T1", "T2", "T3", "T4"):
         slot = box.get(box_key)
         if not isinstance(slot, dict) or slot.get("state") != "connect":
             continue
+        any_connected = True
         letter = slot.get("filament")
         if not letter or letter == "None":
             continue
@@ -111,7 +116,7 @@ def _active_spool(box: dict) -> tuple[str, str, str] | None:
         for _material_code, color_hex, tags, material_name in same_material:
             if tag in tags:
                 return tag, material_name, _color_emoji(color_hex)
-    return None
+    return "changing" if any_connected else None
 
 
 def _active_ams_spool(ams_info: dict) -> tuple[str, str, str] | None:
@@ -157,9 +162,11 @@ def _vt_tray_spool(vt_tray: dict) -> tuple[str, str] | None:
     return material, _color_emoji(color_hex)
 
 
-def _spool_line(spool: tuple[str, str, str] | None) -> str:
+def _spool_line(spool: tuple[str, str, str] | str | None) -> str:
     """Строка с катушкой для сообщения о печати: позиция слота A-D показана
     смещением цветного эмодзи внутри '[----]', плюс тег слота и материал."""
+    if spool == "changing":
+        return t("snapshot.spool_changing")
     if spool is None:
         return t("snapshot.spool_external")
     tag, material, emoji = spool
