@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Moonraker progress percentage is now computed from `virtual_sdcard.progress` (file byte position) instead of `display_status.progress` (slicer time estimate, drifts on prints with filament-change pauses).
+- Bambu/Moonraker logic moved out of `bot.py` into separate connector modules (`connectors/`) behind a shared `PrinterConnector` interface (`connectors/base.py`) and `PrinterState`/`SpoolInfo` types (`models.py`) - adding support for a new printer or multi-material system now only requires dropping a new file into `connectors/`, no core file needs editing (see README, "Adding hardware support"). External behavior and message format are unchanged.
 
 ### Note
 

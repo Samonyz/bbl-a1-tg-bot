@@ -113,6 +113,19 @@ docker compose up -d --build
 
 Все сообщения, отправляемые в Telegram (метки статусов, уведомления о событиях, тексты диалога добавления принтера, ответы на команды), берутся из `locales.py` в зависимости от переменной окружения `LOCALE`. Поддерживаются значения `ru` и `en`. Чтобы добавить другой язык, добавьте новую запись в словарь `LOCALES` в `locales.py` с тем же набором ключей.
 
+## Поддержка нового оборудования
+
+Логика конкретного железа изолирована в `connectors/` — ядро бота (`bot.py`) знает только про интерфейс `PrinterConnector` (`connectors/base.py`) и про типы `PrinterState`/`SpoolInfo` (`models.py`), а не про MQTT/HTTP/протоколы конкретных принтеров.
+
+Чтобы добавить новый тип принтера или мультиматериальной системы:
+
+1. Создайте `connectors/my_printer.py` с классом-наследником `PrinterConnector`, реализующим `from_config`, `test_connection`, `draft_summary`, `poll`, `get_photo` (и опционально `set_light`/`close`). Задайте `TYPE_KEY`, `DISPLAY_NAME`, `SECTION_KEY`, `FIELD_SPECS`, `REQUIRED_FIELDS`.
+2. Присвойте класс `CONNECTOR_CLASS` на уровне модуля — бот подхватит его автоматически при старте (авто-обнаружение в `connectors/__init__.py`), никакой другой файл редактировать не нужно. Новая секция в `printers.yaml` (по вашему `SECTION_KEY`) и кнопка в `/add_printer` появятся сами.
+3. Известные типы данных (процент, слой, высота, катушка) — типизированные поля `PrinterState`. Всё остальное специфичное для вашего железа (температура камеры, влажность и т.п.) кладите в `PrinterState.extra` списком `ExtraField(key, values)` — ядро отрендерит их через `t(f"{TYPE_KEY}.{key}", **values)`.
+4. Для своих строк локализации задайте `LOCALES = {"ru": {...}, "en": {...}}` на уровне класса — того же вида, что верхнеуровневый `LOCALES` в `locales.py`. Ключи автоматически неймспейсятся под ваш `TYPE_KEY` при загрузке (`chamber_temp` → `my_printer.chamber_temp`), так что коллизии с другими коннекторами или ядром исключены.
+
+`connectors/bambu.py` и `connectors/moonraker.py` — рабочие примеры (MQTT- и HTTP-коннекторы соответственно).
+
 ## Примечания
 
 - На Bambu-принтере должен быть включён LAN-режим / доступ только по LAN — иначе порты MQTT (8883) и камеры (6000) недоступны в локальной сети.
@@ -238,6 +251,19 @@ Commands are only accepted from the chat ID configured in `TELEGRAM_CHAT_ID`; me
 ## Localization
 
 All messages sent to Telegram (state labels, event notifications, add-printer dialog text, command replies) are looked up from `locales.py` based on the `LOCALE` environment variable. Supported values are `ru` and `en`. To add another language, add a new entry to the `LOCALES` dictionary in `locales.py` with the same set of keys.
+
+## Adding hardware support
+
+Hardware-specific logic is isolated in `connectors/` — the core (`bot.py`) only knows about the `PrinterConnector` interface (`connectors/base.py`) and the `PrinterState`/`SpoolInfo` types (`models.py`), not about any particular printer's MQTT/HTTP protocol.
+
+To add a new printer type or multi-material system:
+
+1. Create `connectors/my_printer.py` with a `PrinterConnector` subclass implementing `from_config`, `test_connection`, `draft_summary`, `poll`, `get_photo` (and optionally `set_light`/`close`). Set `TYPE_KEY`, `DISPLAY_NAME`, `SECTION_KEY`, `FIELD_SPECS`, `REQUIRED_FIELDS`.
+2. Assign the class to a module-level `CONNECTOR_CLASS` — the bot picks it up automatically at startup (auto-discovery in `connectors/__init__.py`), no other file needs editing. The `printers.yaml` section (your `SECTION_KEY`) and the `/add_printer` button appear on their own.
+3. Well-known fields (percent, layer, height, spool) are typed `PrinterState` fields. Anything specific to your hardware (chamber temp, humidity, etc.) goes into `PrinterState.extra` as a list of `ExtraField(key, values)` — the core renders each via `t(f"{TYPE_KEY}.{key}", **values)`.
+4. For your own locale strings, set a class-level `LOCALES = {"ru": {...}, "en": {...}}`, shaped like the top-level `LOCALES` in `locales.py`. Keys are auto-namespaced under your `TYPE_KEY` on load (`chamber_temp` → `my_printer.chamber_temp`), so there's no risk of colliding with the core or other connectors.
+
+`connectors/bambu.py` and `connectors/moonraker.py` are working examples (an MQTT-based and an HTTP-based connector, respectively).
 
 ## Notes
 

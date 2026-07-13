@@ -4,22 +4,18 @@ import tempfile
 
 import yaml
 
-NAME_RE = re.compile(r"^[a-z0-9_]{1,20}$")
+from connectors.base import PrinterConnector
 
-SECTION_KEYS = {"bambu": "bambu_printers", "moonraker": "moonraker_printers"}
-REQUIRED_FIELDS = {
-    "bambu": ("name", "ip", "access_code", "serial"),
-    "moonraker": ("name", "moonraker_url", "camera_snapshot_url"),
-}
+NAME_RE = re.compile(r"^[a-z0-9_]{1,20}$")
 
 
 class PrintersConfigError(Exception):
     pass
 
 
-def validate_entry(entry: dict, printer_type: str, existing_names: set) -> None:
-    section = SECTION_KEYS[printer_type]
-    required = REQUIRED_FIELDS[printer_type]
+def validate_entry(entry: dict, connector_cls: type[PrinterConnector], existing_names: set) -> None:
+    section = connector_cls.SECTION_KEY
+    required = connector_cls.REQUIRED_FIELDS
 
     missing = [field for field in required if not entry.get(field)]
     if missing:
@@ -36,11 +32,13 @@ def validate_entry(entry: dict, printer_type: str, existing_names: set) -> None:
     if name in existing_names:
         raise PrintersConfigError(
             f"{section}: имя {name!r} повторяется (имена должны быть уникальны "
-            f"среди bambu_printers и moonraker_printers вместе)"
+            f"среди всех типов принтеров вместе)"
         )
 
 
-def load_printers(path: str) -> tuple[list[dict], list[dict]]:
+def load_printers(path: str, connector_types: dict[str, type[PrinterConnector]]) -> dict[str, list[dict]]:
+    """Возвращает {type_key: [entry, ...]} для каждого зарегистрированного
+    типа коннектора, найденного в YAML-манифесте по его SECTION_KEY."""
     try:
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
@@ -49,28 +47,24 @@ def load_printers(path: str) -> tuple[list[dict], list[dict]]:
     except yaml.YAMLError as e:
         raise PrintersConfigError(f"Не удалось разобрать YAML {path}: {e}") from e
 
-    bambu_printers = data.get("bambu_printers") or []
-    moonraker_printers = data.get("moonraker_printers") or []
-
-    if not bambu_printers and not moonraker_printers:
-        raise PrintersConfigError(
-            f"{path}: не задано ни одного принтера в bambu_printers/moonraker_printers"
-        )
-
+    result: dict[str, list[dict]] = {}
     seen_names: set = set()
 
-    for entry in bambu_printers:
-        validate_entry(entry, "bambu", seen_names)
-        seen_names.add(entry["name"])
+    for type_key, connector_cls in connector_types.items():
+        entries = data.get(connector_cls.SECTION_KEY) or []
+        for entry in entries:
+            validate_entry(entry, connector_cls, seen_names)
+            seen_names.add(entry["name"])
+        result[type_key] = entries
 
-    for entry in moonraker_printers:
-        validate_entry(entry, "moonraker", seen_names)
-        seen_names.add(entry["name"])
+    if not any(result.values()):
+        sections = ", ".join(cls.SECTION_KEY for cls in connector_types.values())
+        raise PrintersConfigError(f"{path}: не задано ни одного принтера ни в одной секции ({sections})")
 
-    return bambu_printers, moonraker_printers
+    return result
 
 
-def append_printer(path: str, printer_type: str, entry: dict) -> None:
+def append_printer(path: str, connector_cls: type[PrinterConnector], entry: dict) -> None:
     """Дописывает новую запись принтера в YAML-манифест атомарно.
 
     Файл переписывается целиком через yaml.safe_dump, поэтому ручные
@@ -82,7 +76,7 @@ def append_printer(path: str, printer_type: str, entry: dict) -> None:
     except FileNotFoundError:
         data = {}
 
-    section = SECTION_KEYS[printer_type]
+    section = connector_cls.SECTION_KEY
     data.setdefault(section, []).append(entry)
 
     directory = os.path.dirname(os.path.abspath(path)) or "."

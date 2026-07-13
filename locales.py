@@ -1,3 +1,6 @@
+import logging
+import os
+
 LOCALES = {
     "ru": {
         "state.IDLE": "простаивает",
@@ -23,6 +26,7 @@ LOCALES = {
         "event.finished": "Печать успешно завершена",
         "event.failed": "Печать завершилась с ошибкой",
         "event.error": "Обнаружена ошибка принтера, код: {code}\nРасшифровка: {url}",
+        "event.error_no_url": "Обнаружена ошибка принтера, код: {code}",
         "cmd.start_intro": "Бот мониторинга принтеров запущен.",
         "cmd.help_status_all": "— краткий статус всех принтеров",
         "cmd.camera_unavailable": "Камера недоступна",
@@ -82,6 +86,7 @@ LOCALES = {
         "event.finished": "Print finished successfully",
         "event.failed": "Print failed",
         "event.error": "Printer error detected, code: {code}\nReference: {url}",
+        "event.error_no_url": "Printer error detected, code: {code}",
         "cmd.start_intro": "Printer monitoring bot is running.",
         "cmd.help_status_all": "- short status of all printers",
         "cmd.camera_unavailable": "Camera unavailable",
@@ -130,3 +135,26 @@ def get_translator(locale: str):
         return template.format(**kwargs) if kwargs else template
 
     return t
+
+
+def register_connector_locales(type_key: str, connector_locales: dict[str, dict[str, str]]) -> None:
+    """Добавляет строки локализации от коннектора оборудования, автоматически
+    неймспейся их под type_key ("chamber_temp" -> "bambu.chamber_temp") -
+    гарантирует отсутствие коллизий между модулями без координации между их
+    авторами. Мутирует существующие словари LOCALES[locale] на месте (а не
+    переприсваивает), поэтому уже созданные t()-замыкания (см. ниже) увидят
+    новые ключи независимо от порядка импорта."""
+    for locale, entries in connector_locales.items():
+        LOCALES.setdefault(locale, {}).update(
+            {f"{type_key}.{key}": value for key, value in entries.items()}
+        )
+
+
+_LOCALE = os.environ.get("LOCALE", DEFAULT_LOCALE).lower()
+if _LOCALE not in LOCALES:
+    logging.getLogger(__name__).warning(
+        "Unknown LOCALE %r, falling back to %r", _LOCALE, DEFAULT_LOCALE
+    )
+    _LOCALE = DEFAULT_LOCALE
+
+t = get_translator(_LOCALE)

@@ -9,6 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py locales.py printers_config.py ./
+COPY bot.py locales.py printers_config.py models.py formatting.py ./
+COPY connectors ./connectors
 
 CMD ["python", "bot.py"]
