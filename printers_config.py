@@ -64,21 +64,12 @@ def load_printers(path: str, connector_types: dict[str, type[PrinterConnector]])
     return result
 
 
-def append_printer(path: str, connector_cls: type[PrinterConnector], entry: dict) -> None:
-    """Дописывает новую запись принтера в YAML-манифест атомарно.
+def _atomic_write(path: str, data: dict) -> None:
+    """Переписывает YAML-манифест целиком атомарно (через tmp-файл + rename).
 
     Файл переписывается целиком через yaml.safe_dump, поэтому ручные
     комментарии в нём не сохраняются.
     """
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        data = {}
-
-    section = connector_cls.SECTION_KEY
-    data.setdefault(section, []).append(entry)
-
     directory = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".printers.", suffix=".yaml")
     try:
@@ -88,3 +79,39 @@ def append_printer(path: str, connector_cls: type[PrinterConnector], entry: dict
     except Exception:
         os.unlink(tmp_path)
         raise
+
+
+def append_printer(path: str, connector_cls: type[PrinterConnector], entry: dict) -> None:
+    """Дописывает новую запись принтера в YAML-манифест."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        data = {}
+
+    data.setdefault(connector_cls.SECTION_KEY, []).append(entry)
+    _atomic_write(path, data)
+
+
+def update_printer_fields(
+    path: str, connector_cls: type[PrinterConnector], name: str, updates: dict
+) -> None:
+    """Обновляет одно или несколько полей у существующей записи принтера по
+    имени (например, message_thread_id после создания форум-топика,
+    progress_message_id/progress_message_filename при отправке сообщения
+    прогресса - чтобы переживало перезапуск бота). Значение None в updates
+    удаляет поле из записи. Если записи с таким именем нет в этой секции -
+    тихо ничего не делает."""
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    for entry in data.get(connector_cls.SECTION_KEY) or []:
+        if entry.get("name") == name:
+            for key, value in updates.items():
+                if value is None:
+                    entry.pop(key, None)
+                else:
+                    entry[key] = value
+            break
+
+    _atomic_write(path, data)

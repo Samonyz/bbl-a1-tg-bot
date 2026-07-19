@@ -10,11 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Active spool display in print status: color (emoji) and slot position (`T1`-`T4`, `A`-`D`) for Creality CFS and Bambu AMS in a unified `[-emoji--] T1B PLA` format. Without AMS/CFS, or when printing from the external holder, a separate line shows the external filament's material/color if known.
+- Forum topics (`TELEGRAM_USE_TOPICS`): a dedicated topic per printer, with the progress message pinned there while printing. The topic and pinned-message ids are saved to `printers.yaml` and survive bot restarts. Short `/status`/`/photo` aliases (no name) work inside a printer's topic. Disabled by default.
 
 ### Changed
 
 - Moonraker progress percentage is now computed from `virtual_sdcard.progress` (file byte position) instead of `display_status.progress` (slicer time estimate, drifts on prints with filament-change pauses).
 - Bambu/Moonraker logic moved out of `bot.py` into separate connector modules (`connectors/`) behind a shared `PrinterConnector` interface (`connectors/base.py`) and `PrinterState`/`SpoolInfo` types (`models.py`) - adding support for a new printer or multi-material system now only requires dropping a new file into `connectors/`, no core file needs editing (see README, "Adding hardware support"). External behavior and message format are unchanged.
+- `printers.yaml` is now mounted as the `data/` directory instead of as a single file - writing to it (topics, pinned-message ids, `/add_printer`) needs rename-over-bind-mount support, which a single-file mount doesn't provide.
+
+### Fixed
+
+- Saving printers added via `/add_printer` to `printers.yaml` didn't actually work in production (silently degraded to "saved until restart only") because of the same single-file mount - fixed by the same mount change.
 
 ### Note
 

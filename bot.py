@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 
 from PIL import Image
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
@@ -22,7 +22,14 @@ from connectors import CONNECTOR_TYPES
 from formatting import format_snapshot
 from locales import t
 from models import PAUSED_STATES, RUNNING_STATES, PrinterState, PrintState
-from printers_config import NAME_RE, PrintersConfigError, append_printer, load_printers, validate_entry
+from printers_config import (
+    NAME_RE,
+    PrintersConfigError,
+    append_printer,
+    load_printers,
+    update_printer_fields,
+    validate_entry,
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -38,6 +45,12 @@ DEFAULT_POLL_INTERVAL_SECONDS = float(os.environ.get("DEFAULT_POLL_INTERVAL_SECO
 DEFAULT_PROGRESS_UPDATE_SECONDS = float(
     os.environ.get("DEFAULT_PROGRESS_UPDATE_SECONDS", 60)
 )
+# Режим форум-топиков: один принтер - один топик в супергруппе с включёнными
+# темами (Settings -> Topics в клиенте Telegram; группа должна быть именно
+# супергруппой - конвертация из обычной группы происходит на стороне Telegram
+# при включении тем, и chat_id при этом меняется - см. README). Выключено по
+# умолчанию, чтобы не менять поведение существующих инсталляций.
+TELEGRAM_USE_TOPICS = os.environ.get("TELEGRAM_USE_TOPICS", "false").lower() == "true"
 
 
 def _now_str() -> str:
@@ -68,19 +81,47 @@ class PrinterSession:
     обнаружение переходов состояния) вокруг одного PrinterConnector.
     Ничего здесь не знает про конкретное железо - только про PrinterState."""
 
-    def __init__(self, connector, chat_id: int, progress_update_seconds: float):
+    def __init__(
+        self,
+        connector,
+        chat_id: int,
+        progress_update_seconds: float,
+        message_thread_id: int | None = None,
+        progress_message_id: int | None = None,
+        progress_message_filename: str | None = None,
+    ):
         self.connector = connector
         self.tag = connector.tag
         self.chat_id = chat_id
         self.progress_update_seconds = progress_update_seconds
+        self.message_thread_id = message_thread_id
         self.prev_state: PrintState | None = None
         self.prev_error_code: int = 0
         self.last_progress_update: float | None = None
-        self.progress_message_id: int | None = None
+        # Восстановленные из printers.yaml (переживают перезапуск бота) - при
+        # первом poll_job после старта сверяются с текущим именем файла
+        # печати: совпало - продолжаем редактировать то же сообщение и не
+        # переpin'иваем; не совпало (печать сменилась, пока бот был выключен)
+        # - считаем устаревшими и создаём новое (см. poll_job).
+        self.progress_message_id: int | None = progress_message_id
+        self._expected_filename: str | None = progress_message_filename
         self._last_photo: bytes | None = None
 
     def _tagged(self, text: str) -> str:
         return f"[{self.tag}] {text}"
+
+    def _persist_progress_message(self, message_id: int | None, filename: str | None) -> None:
+        if self.message_thread_id is None:
+            return  # без топиков нет смысла переживать перезапуск - и так был бы новый чат-поток
+        try:
+            update_printer_fields(
+                PRINTERS_CONFIG,
+                type(self.connector),
+                self.tag,
+                {"progress_message_id": message_id, "progress_message_filename": filename},
+            )
+        except Exception:
+            log.exception("Failed to persist progress_message_id for [%s]", self.tag)
 
     async def _cached_photo(self, fresh: bytes | None) -> bytes:
         """Кэширует последний реально полученный кадр с камеры на время
@@ -112,7 +153,12 @@ class PrinterSession:
         photo = await self.get_photo()
         timestamp = t("footer.time", time=_now_str())
         message = self._tagged(f"{text}\n\n{details}\n\n{timestamp}")
-        await context.bot.send_photo(chat_id=self.chat_id, photo=photo, caption=message)
+        await context.bot.send_photo(
+            chat_id=self.chat_id,
+            message_thread_id=self.message_thread_id,
+            photo=photo,
+            caption=message,
+        )
 
     async def update_progress_message(self, context: ContextTypes.DEFAULT_TYPE, state: PrinterState) -> None:
         timestamp = t("footer.last_updated", time=_now_str())
@@ -148,9 +194,31 @@ class PrinterSession:
                 self.progress_message_id = None
 
         msg = await context.bot.send_photo(
-            chat_id=self.chat_id, photo=photo, caption=caption
+            chat_id=self.chat_id,
+            message_thread_id=self.message_thread_id,
+            photo=photo,
+            caption=caption,
         )
         self.progress_message_id = msg.message_id
+        self._expected_filename = state.filename
+        self._persist_progress_message(msg.message_id, state.filename)
+        log.info(
+            "Sent new progress message [%s]: message_id=%s, thread_id=%s",
+            self.tag,
+            msg.message_id,
+            self.message_thread_id,
+        )
+
+        if self.message_thread_id is not None:
+            # Закрепляем сообщение прогресса ТЕКУЩЕЙ печати в её топике -
+            # снимается при завершении печати (см. poll_job).
+            try:
+                await context.bot.pin_chat_message(
+                    chat_id=self.chat_id, message_id=msg.message_id, disable_notification=True
+                )
+                log.info("Pinned progress message [%s]: message_id=%s", self.tag, msg.message_id)
+            except TelegramError as e:
+                log.warning("Не удалось закрепить сообщение прогресса [%s]: %s", self.tag, e)
 
     async def poll_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
@@ -158,6 +226,26 @@ class PrinterSession:
         except Exception:
             log.exception("Failed to read printer state [%s]", self.tag)
             return
+
+        if (
+            self.progress_message_id is not None
+            and self._expected_filename is not None
+            and state.filename != self._expected_filename
+        ):
+            # Восстановленное после перезапуска сообщение прогресса относится
+            # к другой печати (файл другой) - за время простоя бота печать
+            # сменилась. Продолжать редактировать его нельзя, а закрепление
+            # снимаем, чтобы старое не висело неактуальным.
+            if self.message_thread_id is not None:
+                try:
+                    await context.bot.unpin_chat_message(
+                        chat_id=self.chat_id, message_id=self.progress_message_id
+                    )
+                except TelegramError:
+                    pass
+            self.progress_message_id = None
+            self._expected_filename = None
+            self._persist_progress_message(None, None)
 
         events = []
         just_started = False
@@ -179,7 +267,16 @@ class PrinterSession:
             if state.state not in RUNNING_STATES and state.state not in PAUSED_STATES:
                 # печать закончилась (или сброшена в IDLE) - следующая начнётся
                 # с нового сообщения прогресса и своего кадра камеры
+                if self.message_thread_id is not None and self.progress_message_id is not None:
+                    try:
+                        await context.bot.unpin_chat_message(
+                            chat_id=self.chat_id, message_id=self.progress_message_id
+                        )
+                    except TelegramError as e:
+                        log.warning("Не удалось снять закрепление [%s]: %s", self.tag, e)
                 self.progress_message_id = None
+                self._expected_filename = None
+                self._persist_progress_message(None, None)
                 self.last_progress_update = None
                 self._last_photo = None
 
@@ -215,22 +312,52 @@ def authorized(update: Update) -> bool:
     return update.effective_chat is not None and update.effective_chat.id == TELEGRAM_CHAT_ID
 
 
-async def _reply_status(update: Update, session: PrinterSession) -> None:
+def _session_for_thread(context: ContextTypes.DEFAULT_TYPE, message_thread_id: int | None) -> PrinterSession | None:
+    """Находит принтера по треду, в котором написана команда - чтобы внутри
+    топика принтера работали короткие алиасы /status, /photo без имени."""
+    if message_thread_id is None:
+        return None
+    for session in context.bot_data["sessions"].values():
+        if session.message_thread_id == message_thread_id:
+            return session
+    return None
+
+
+async def _reply_status(update: Update, context: ContextTypes.DEFAULT_TYPE, session: PrinterSession) -> None:
+    # Отвечаем в топик принтера (если он есть), а не туда, откуда пришла
+    # команда - так весь его статус остаётся в одном месте.
     text = f"{await session.get_snapshot_text()}\n\n{t('footer.time', time=_now_str())}"
     photo = await session.get_photo()
-    await update.message.reply_photo(photo=photo, caption=text)
+    await context.bot.send_photo(
+        chat_id=update.effective_chat.id,
+        message_thread_id=session.message_thread_id,
+        photo=photo,
+        caption=text,
+    )
 
 
-async def _reply_photo(update: Update, session: PrinterSession) -> None:
+async def _reply_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, session: PrinterSession) -> None:
     photo = await session.get_photo()
     if photo == _placeholder_photo():
-        await update.message.reply_text(t("cmd.camera_unavailable"))
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            message_thread_id=session.message_thread_id,
+            text=t("cmd.camera_unavailable"),
+        )
     else:
-        await update.message.reply_photo(photo=photo)
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            message_thread_id=session.message_thread_id,
+            photo=photo,
+        )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
+        return
+    session = _session_for_thread(context, update.message.message_thread_id)
+    if session is not None:
+        await _reply_status(update, context, session)
         return
     sessions = list(context.bot_data["sessions"].values())
     texts = await asyncio.gather(*(s.get_snapshot_text() for s in sessions))
@@ -238,11 +365,21 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(text)
 
 
+async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    session = _session_for_thread(context, update.message.message_thread_id)
+    if session is None:
+        await update.message.reply_text(t("cmd.photo_no_context"))
+        return
+    await _reply_photo(update, context, session)
+
+
 def make_status_handler(name: str):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not authorized(update):
             return
-        await _reply_status(update, context.bot_data["sessions"][name])
+        await _reply_status(update, context, context.bot_data["sessions"][name])
 
     return handler
 
@@ -251,7 +388,7 @@ def make_photo_handler(name: str):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not authorized(update):
             return
-        await _reply_photo(update, context.bot_data["sessions"][name])
+        await _reply_photo(update, context, context.bot_data["sessions"][name])
 
     return handler
 
@@ -262,7 +399,11 @@ def make_light_on_handler(name: str):
             return
         session: PrinterSession = context.bot_data["sessions"][name]
         await session.connector.set_light(True)
-        await update.message.reply_text(t("cmd.light_on"))
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            message_thread_id=session.message_thread_id,
+            text=t("cmd.light_on"),
+        )
 
     return handler
 
@@ -273,7 +414,11 @@ def make_light_off_handler(name: str):
             return
         session: PrinterSession = context.bot_data["sessions"][name]
         await session.connector.set_light(False)
-        await update.message.reply_text(t("cmd.light_off"))
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            message_thread_id=session.message_thread_id,
+            text=t("cmd.light_off"),
+        )
 
     return handler
 
@@ -463,9 +608,20 @@ async def cb_confirming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await query.edit_message_text(str(e))
         return ConversationHandler.END
 
+    message_thread_id = None
+    if TELEGRAM_USE_TOPICS:
+        try:
+            topic = await context.bot.create_forum_topic(chat_id=TELEGRAM_CHAT_ID, name=name)
+            message_thread_id = topic.message_thread_id
+        except TelegramError:
+            log.exception("Failed to create forum topic for printer %r", name)
+
     connector = context.user_data["tested_connector"]
     session = PrinterSession(
-        connector, chat_id=TELEGRAM_CHAT_ID, progress_update_seconds=DEFAULT_PROGRESS_UPDATE_SECONDS
+        connector,
+        chat_id=TELEGRAM_CHAT_ID,
+        progress_update_seconds=DEFAULT_PROGRESS_UPDATE_SECONDS,
+        message_thread_id=message_thread_id,
     )
 
     context.bot_data["sessions"][name] = session
@@ -476,6 +632,8 @@ async def cb_confirming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     )
 
     entry = {k: v for k, v in draft.items() if v is not None}
+    if message_thread_id is not None:
+        entry["message_thread_id"] = message_thread_id
     try:
         append_printer(PRINTERS_CONFIG, connector_cls, entry)
         saved_note = ""
@@ -512,12 +670,46 @@ def build_add_printer_conversation() -> ConversationHandler:
     )
 
 
+async def _ensure_topics(printers_by_type: dict[str, list[dict]]) -> None:
+    """Создаёт форум-топик для каждого принтера, у которого его ещё нет, и
+    сохраняет message_thread_id в printers.yaml - чтобы топик создавался
+    один раз, а не при каждом перезапуске бота."""
+    bot = Bot(TELEGRAM_BOT_TOKEN)
+    for type_key, entries in printers_by_type.items():
+        connector_cls = CONNECTOR_TYPES[type_key]
+        for cfg in entries:
+            if cfg.get("message_thread_id"):
+                continue
+            name = cfg["name"]
+            try:
+                topic = await bot.create_forum_topic(chat_id=TELEGRAM_CHAT_ID, name=name)
+            except TelegramError:
+                log.exception("Failed to create forum topic for printer %r", name)
+                continue
+            cfg["message_thread_id"] = topic.message_thread_id
+            log.info("Created forum topic for printer %r (thread_id=%s)", name, topic.message_thread_id)
+            try:
+                update_printer_fields(
+                    PRINTERS_CONFIG, connector_cls, name, {"message_thread_id": topic.message_thread_id}
+                )
+            except Exception:
+                # Топик уже создан и используется в этой сессии (cfg обновлён
+                # выше) - сбой записи в printers.yaml не должен ронять бота,
+                # просто топик пересоздастся заново при следующем перезапуске.
+                log.exception(
+                    "Failed to persist message_thread_id for printer %r to %s", name, PRINTERS_CONFIG
+                )
+
+
 def main() -> None:
     try:
         printers_by_type = load_printers(PRINTERS_CONFIG, CONNECTOR_TYPES)
     except PrintersConfigError as e:
         log.error("Ошибка конфигурации принтеров: %s", e)
         raise SystemExit(1)
+
+    if TELEGRAM_USE_TOPICS:
+        asyncio.run(_ensure_topics(printers_by_type))
 
     sessions: dict[str, PrinterSession] = {}
     cfg_by_name: dict[str, dict] = {}
@@ -534,6 +726,9 @@ def main() -> None:
                 progress_update_seconds=cfg.get(
                     "progress_update_seconds", DEFAULT_PROGRESS_UPDATE_SECONDS
                 ),
+                message_thread_id=cfg.get("message_thread_id"),
+                progress_message_id=cfg.get("progress_message_id"),
+                progress_message_filename=cfg.get("progress_message_filename"),
             )
             cfg_by_name[name] = cfg
             type_by_name[name] = connector_cls
@@ -542,6 +737,7 @@ def main() -> None:
     application.bot_data["sessions"] = sessions
 
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("photo", cmd_photo))
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("list_printers", cmd_list_printers))
     application.add_handler(build_add_printer_conversation())

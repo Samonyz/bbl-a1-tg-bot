@@ -33,15 +33,18 @@
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Токен бота от @BotFather. |
 | `TELEGRAM_CHAT_ID` | Числовой ID чата: сюда шлются уведомления, отсюда принимаются команды. |
-| `PRINTERS_CONFIG` | Путь к манифесту принтеров внутри контейнера. По умолчанию: `printers.yaml`. |
+| `PRINTERS_CONFIG` | Путь к манифесту принтеров внутри контейнера. По умолчанию: `printers.yaml` — но реально в `docker-compose.yml` смонтирована директория `./data:/data`, так что путь нужно указывать как `/data/printers.yaml` (см. `.env.example`). |
 | `DEFAULT_POLL_INTERVAL_SECONDS` | Дефолтный интервал опроса принтера, секунды, если не переопределён в `printers.yaml` для конкретного принтера. По умолчанию: 5. |
 | `DEFAULT_PROGRESS_UPDATE_SECONDS` | Дефолтный интервал обновления сообщения прогресса, секунды, если не переопределён в `printers.yaml`. По умолчанию: 60. |
 | `LOCALE` | Язык сообщений, отправляемых в Telegram: `ru` или `en`. По умолчанию: `ru`. При некорректном значении откатывается на `ru` с предупреждением в логах. |
 | `TZ` | Часовой пояс для таймстампов в сообщениях, например `Europe/Moscow`. По умолчанию: `UTC`. Требует пакет `tzdata`, который уже установлен в образе. |
+| `TELEGRAM_USE_TOPICS` | `true`/`false`. По умолчанию `false` (один общий чат, как раньше). При `true` — свой форум-топик на каждый принтер: туда идут его уведомления и сообщение прогресса, оно же закреплено там на время печати. |
+
+`TELEGRAM_USE_TOPICS=true` требует, чтобы `TELEGRAM_CHAT_ID` был супергруппой с включёнными Topics (Settings → Topics в клиенте). Включение Topics в обычной группе конвертирует её в супергруппу и меняет chat_id — обновите `TELEGRAM_CHAT_ID` после конвертации. Топик и id закреплённого сообщения сохраняются в `printers.yaml` и переживают перезапуск бота — топик не пересоздаётся, сообщение прогресса продолжает редактироваться, а не дублируется.
 
 ### `printers.yaml`
 
-Список принтеров задаётся отдельно от `.env` — скопируйте `printers.example.yaml` в `printers.yaml` (файл гарантированно не попадёт в git — он в `.gitignore`, как и `.env`) и опишите свои принтеры:
+Список принтеров задаётся отдельно от `.env` — скопируйте `printers.example.yaml` в `data/printers.yaml` (файл гарантированно не попадёт в git — он в `.gitignore`, как и `.env`; директория `data/` целиком монтируется в контейнер, см. ниже) и опишите свои принтеры:
 
 ```yaml
 bambu_printers:
@@ -63,7 +66,7 @@ moonraker_printers:
 
 `name` — латиница в нижнем регистре, цифры и `_`, до 20 символов. Используется как тег в сообщениях (`[name] ...`) и как суффикс команд (`/status_<name>` и т.д.). Имена должны быть уникальны среди `bambu_printers` и `moonraker_printers` вместе — бот откажется стартовать с понятной ошибкой, если найдёт дубликат, невалидное имя или отсутствующее обязательное поле.
 
-Файл монтируется в контейнер как volume (см. `docker-compose.yml`), поэтому его можно менять без пересборки образа — только `docker compose restart`. Правки, сделанные ботом через `/add_printer` (см. ниже), тоже пишутся в этот файл, но без сохранения комментариев (файл перезаписывается целиком через YAML-дамп).
+Директория `data/` монтируется в контейнер как volume целиком (см. `docker-compose.yml`), поэтому файл можно менять без пересборки образа — только `docker compose restart`. Правки, сделанные ботом через `/add_printer` (см. ниже), тоже пишутся в этот файл, но без сохранения комментариев (файл перезаписывается целиком через YAML-дамп). **Важно:** монтируется именно директория, а не сам файл — атомарная перезапись (временный файл + rename) не работает, если в контейнер смонтирован непосредственно файл (`EBUSY`).
 
 ## Запуск
 
@@ -97,9 +100,9 @@ docker compose up -d --build
 | Команда | Описание |
 |---|---|
 | `/start` | Справка со списком актуальных команд для загруженных принтеров. |
-| `/status` | Краткий статус всех принтеров сразу. |
-| `/status_<name>` | Статус и снимок с камеры конкретного принтера. |
-| `/photo_<name>` | Только снимок с камеры конкретного принтера. |
+| `/status` | Краткий статус всех принтеров сразу. Внутри топика принтера (см. `TELEGRAM_USE_TOPICS`) — статус только этого принтера. |
+| `/status_<name>`, `/photo_<name>` | Статус (со снимком камеры) или только снимок конкретного принтера. |
+| `/photo` | Снимок конкретного принтера — только внутри его топика. |
 | `/light_on_<name>`, `/light_off_<name>` | Включить/выключить свет камеры — только для принтеров Bambu. |
 | `/list_printers` | Список принтеров, находящихся под мониторингом, с указанием типа. |
 | `/add_printer` | Диалог добавления нового принтера (см. ниже). |
@@ -172,15 +175,18 @@ Copy `.env.example` to `.env` and fill in the values — only bot-wide settings 
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather. |
 | `TELEGRAM_CHAT_ID` | Numeric chat ID: notifications go here, commands are accepted from here. |
-| `PRINTERS_CONFIG` | Path to the printer manifest inside the container. Default: `printers.yaml`. |
+| `PRINTERS_CONFIG` | Path to the printer manifest inside the container. Default: `printers.yaml` — but `docker-compose.yml` actually mounts the `./data:/data` directory, so the path should be `/data/printers.yaml` (see `.env.example`). |
 | `DEFAULT_POLL_INTERVAL_SECONDS` | Default polling interval in seconds, used when a printer entry in `printers.yaml` doesn't override it. Default: 5. |
 | `DEFAULT_PROGRESS_UPDATE_SECONDS` | Default progress-message update interval in seconds, used when a printer entry doesn't override it. Default: 60. |
 | `LOCALE` | Language of the messages sent to Telegram: `ru` or `en`. Default: `ru`. Falls back to `ru` with a warning in the logs if set to anything else. |
 | `TZ` | Timezone used for message timestamps, e.g. `Europe/Moscow`. Default: `UTC`. Requires `tzdata`, which is installed in the image. |
+| `TELEGRAM_USE_TOPICS` | `true`/`false`. Default `false` (one shared chat, as before). When `true` — a dedicated forum topic per printer: its notifications and progress message go there, and the progress message stays pinned there while printing. |
+
+`TELEGRAM_USE_TOPICS=true` requires `TELEGRAM_CHAT_ID` to be a supergroup with Topics enabled (Settings → Topics in the client). Enabling Topics on a regular group converts it to a supergroup and changes its chat_id — update `TELEGRAM_CHAT_ID` after converting. The topic id and the pinned message's id are saved to `printers.yaml` and survive bot restarts — the topic isn't recreated, and the progress message keeps getting edited rather than duplicated.
 
 ### `printers.yaml`
 
-The printer list lives separately from `.env` — copy `printers.example.yaml` to `printers.yaml` (guaranteed not to be committed — it's in `.gitignore`, same as `.env`) and describe your printers:
+The printer list lives separately from `.env` — copy `printers.example.yaml` to `data/printers.yaml` (guaranteed not to be committed — it's in `.gitignore`, same as `.env`; the whole `data/` directory is mounted into the container, see below) and describe your printers:
 
 ```yaml
 bambu_printers:
@@ -202,7 +208,7 @@ moonraker_printers:
 
 `name` must be lowercase Latin letters, digits, and `_`, up to 20 characters. It's used as a tag in messages (`[name] ...`) and as a command suffix (`/status_<name>`, etc). Names must be unique across `bambu_printers` and `moonraker_printers` combined — the bot refuses to start with a clear error if it finds a duplicate, an invalid name, or a missing required field.
 
-The file is mounted into the container as a volume (see `docker-compose.yml`), so it can be edited without rebuilding the image — just `docker compose restart`. Edits made by the bot itself via `/add_printer` (see below) are also written to this file, but comments are not preserved (the file is rewritten wholesale via a YAML dump).
+The `data/` directory is mounted into the container as a volume in full (see `docker-compose.yml`), so the file can be edited without rebuilding the image — just `docker compose restart`. Edits made by the bot itself via `/add_printer` (see below) are also written to this file, but comments are not preserved (the file is rewritten wholesale via a YAML dump). **Important:** the directory is mounted, not the file itself — an atomic rewrite (temp file + rename) doesn't work if the container has the file itself bind-mounted directly (`EBUSY`).
 
 ## Running
 
@@ -236,9 +242,9 @@ Commands are only accepted from the chat ID configured in `TELEGRAM_CHAT_ID`; me
 | Command | Description |
 |---|---|
 | `/start` | Help message listing the commands available for the currently loaded printers. |
-| `/status` | Short status of all printers at once. |
-| `/status_<name>` | Status and camera snapshot of a specific printer. |
-| `/photo_<name>` | Camera snapshot only, for a specific printer. |
+| `/status` | Short status of all printers at once. Inside a printer's topic (see `TELEGRAM_USE_TOPICS`) — status of that printer only. |
+| `/status_<name>`, `/photo_<name>` | Status (with camera snapshot) or just the snapshot for a specific printer. |
+| `/photo` | Snapshot of a specific printer — only inside its topic. |
 | `/light_on_<name>`, `/light_off_<name>` | Turn the chamber light on/off — Bambu printers only. |
 | `/list_printers` | List printers currently under monitoring, with their type. |
 | `/add_printer` | Dialog for adding a new printer (see below). |

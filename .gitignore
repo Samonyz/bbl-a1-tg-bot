@@ -1,4 +1,5 @@
 .env
 printers.yaml
+data/
 __pycache__/
 *.pyc
